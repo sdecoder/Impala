@@ -17,6 +17,7 @@
 SET_SOURCE_FILES_PROPERTIES(${SQUEASEL_SRC_DIR}/squeasel.c PROPERTIES
   COMPILE_FLAGS -DNO_SSL_DL)
 
+
 # where to put generated libraries
 set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/util")
 
@@ -25,6 +26,7 @@ set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/util")
 
 add_library(Util
   avro-util.cc
+  avx-sort-lib.cc
   benchmark.cc
   bitmap.cc
   cgroups-mgr.cc
@@ -101,6 +103,7 @@ target_link_libraries(parquet-reader ${IMPALA_LINK_LIBS})
 
 target_link_libraries(loggingsupport ${IMPALA_LINK_LIBS_DYNAMIC_TARGETS})
 
+ADD_BE_TEST(avx-sort-lib-test)
 ADD_BE_TEST(runtime-profile-test)
 ADD_BE_TEST(benchmark-test)
 ADD_BE_TEST(decompress-test)

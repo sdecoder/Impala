@@ -33,6 +33,8 @@ class CpuInfo {
   static const int64_t SSE4_1  = (1 << 2);
   static const int64_t SSE4_2  = (1 << 3);
   static const int64_t POPCNT  = (1 << 4);
+  static const int64_t AVX     = (1 << 5);
+  static const int64_t AVX2    = (1 << 6);
 
   /// Cache enums for L1 (data), L2 and L3
   enum CacheLevel {
@@ -53,7 +55,7 @@ class CpuInfo {
     DCHECK(initialized_);
     return hardware_flags_;
   }
-  
+
   /// Returns whether of not the cpu supports this flag
   inline static bool IsSupported(long flag) {
     DCHECK(initialized_);
@@ -77,13 +79,13 @@ class CpuInfo {
   }
 
   /// Returns the number of cores (including hyper-threaded) on this machine.
-  static int num_cores() { 
+  static int num_cores() {
     DCHECK(initialized_);
-    return num_cores_; 
+    return num_cores_;
   }
 
   /// Returns the model name of the cpu (e.g. Intel i7-2600)
-  static std::string model_name() { 
+  static std::string model_name() {
     DCHECK(initialized_);
     return model_name_;
   }

@@ -23,6 +23,9 @@
 
 #include "common/names.h"
 
+#include "util/avx-sort-lib.h"
+#include <queue>
+
 using namespace strings;
 
 namespace impala {
@@ -227,6 +230,86 @@ class Sorter::TupleSorter {
   /// Returns early if stste_->is_cancelled() is true. No status
   /// is returned - the caller must check for cancellation.
   void Sort(Run* run);
+  // AVX Sort function collection:
+//  bool CanSortUsingAVX(const ColumnType& type);
+  //  void SetTuplePtrKey(int64_t& carrier_, const int64_t bulk_start, int ptr, int colidx);
+
+  void* GetDataByRowIdxColIdx(const std::vector<ExprContext*>& context, int64_t row_idx, int col_idx);
+  bool SortNthColumn(const int colidx, const int64_t bulk_start, const int bulk_size, const bool asc_sort, int64_t* const localptr);
+
+//  const int64_t osd_itv_start, const int64_t osd_itv_size, int* localptr ){
+  void SetNull(int64_t& carrier_, int colidx);
+  void SortInt32(const int colidx, const int64_t bulk_start,
+    const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr,
+    const ColumnType& type);
+
+  void SortInt64(const int colidx, const int64_t bulk_start,
+    const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr);
+
+  void SortFloat(const int colidx, const int64_t bulk_start,
+    const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr);
+
+  void SortDouble(const int colidx, const int64_t bulk_start,
+    const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr);
+
+  void SortTimestamp(const int colidx, const int64_t bulk_start,
+    const int64_t osd_itv_start, const int64_t osd_itv_size,  int64_t* const localptr);
+
+  void SortTime(const int colidx, const int64_t bulk_start,
+    const int isd_offset, const int isd_size, int64_t* const localptr);
+
+  void SortStringVarchar(const int colidx, const int64_t bulk_start,
+    const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr);
+
+  void SortChar(const int colidx, const ColumnType& type, const int64_t bulk_start,
+    const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr);
+
+  void SortDecimal(const int width, const int colidx, const int64_t bulk_start,
+    const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr);
+
+  void SortDecimal4Value(const int width, const int colidx, const int64_t bulk_start,
+    const int64_t osd_itv_start, const int64_t osd_itv_size,  int64_t* const  localptr);
+
+  void SortDecimal8Value(const int width, const int colidx, const int64_t bulk_start,
+    const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr);
+
+  void SortDecimal16Value(const int width, const int colidx, const int64_t bulk_start,
+    const int64_t osd_itv_start, const int64_t osd_itv_size,  int64_t* const localptr);
+
+  void SorterCore(const int colidx, const int64_t bulk_start,
+    const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr);
+
+  class mycomparison {
+    const TupleRowComparator* comparator;
+    TupleSorter* tuplesorter;
+
+   public:
+    void set_comparator(const TupleRowComparator* input) { comparator = input; }
+    void set_tuple_sorter(TupleSorter* input) { tuplesorter = input; }
+
+    bool operator()(const pair<int64_t, int64_t>& lhs, const pair<int64_t, int64_t>& rhs) const {
+
+      const std::vector<ExprContext*>& context = comparator->get_key_expr_ctxs_lhs_();
+      const int32_t colidx = 0;
+      TupleIterator _cur_a = TupleIterator(tuplesorter, lhs.first);
+      TupleIterator _cur_b = TupleIterator(tuplesorter, rhs.first);
+      TupleRow* row_a = reinterpret_cast<TupleRow*>(&_cur_a.current_tuple_);
+      TupleRow* row_b = reinterpret_cast<TupleRow*>(&_cur_b.current_tuple_);
+
+
+      void* dataptr_a = context[colidx]->GetValue(row_a);
+      void* dataptr_b = context[colidx]->GetValue(row_b);
+      const int32_t i32value_a = *reinterpret_cast<const int32_t*>(dataptr_a);
+      const int32_t i32value_b = *reinterpret_cast<const int32_t*>(dataptr_b);
+
+      return true;
+
+      if(i32value_a < i32value_b) return false;
+      //if ((*comparator)(row_a, row_b)) return false;
+      return true;
+    }
+  };
+
 
  private:
   static const int INSERTION_THRESHOLD = 16;
@@ -847,11 +930,1129 @@ Sorter::TupleSorter::~TupleSorter() {
   delete[] swap_buffer_;
 }
 
-void Sorter::TupleSorter::Sort(Run* run) {
-  run_ = run;
-  SortHelper(TupleIterator(this, 0), TupleIterator(this, run_->num_tuples_));
-  run->is_sorted_ = true;
+
+inline void* Sorter::TupleSorter::GetDataByRowIdxColIdx(const std::vector<ExprContext*>& context, int64_t row_idx, int col_idx) {
+  TupleIterator start_tuple_ = TupleIterator(this, row_idx );
+  TupleRow* tuple_row_ = reinterpret_cast<TupleRow*>(&start_tuple_.current_tuple_);
+  return context[col_idx]->GetValue(tuple_row_);
 }
+
+
+void Sorter::TupleSorter::SetNull(int64_t& carrier_, int colidx){
+  const std::vector<bool>& is_asc_ = less_than_comp_.get_is_asc_();
+  const std::vector<int8_t>& nulls_first = less_than_comp_.get_nulls_first_();
+  bool asc_sort = is_asc_[colidx];
+  int8_t null_first = nulls_first[colidx];
+  if( asc_sort ) {
+    if (null_first > 0) SetInfPos(carrier_);
+    else SetInfNeg(carrier_);
+  } else {
+    if ( null_first > 0 ) SetInfNeg(carrier_);
+    else SetInfPos(carrier_);
+  }
+}
+
+void Sorter::TupleSorter::SortInt32(const int colidx, const int64_t bulk_start,
+  const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr, const ColumnType& type){
+
+  const std::vector<ExprContext*>& key_expr_ctxs_lhs_ = less_than_comp_.get_key_expr_ctxs_lhs_();
+  tuple_t* in; tuple_t* out;
+  posix_memalign((void**)&in, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  posix_memalign((void**)&out, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  memset(in, 0, osd_itv_size* sizeof(tuple_t));
+
+  for (int i = 0; i < osd_itv_size; ++i) {
+    SetPtr(in[i], localptr[osd_itv_start + i]);
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + i];
+    void* vdata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no , colidx);
+    if (vdata == NULL) {
+      SetNull(in[i], colidx);
+    } else {
+      switch (type.type) {
+        case TYPE_BOOLEAN: {
+          const bool bvalue_ = *reinterpret_cast<const bool*>(vdata);
+          SetKeyInt(in[i], bvalue_);
+          continue;
+        }
+        case TYPE_TINYINT: {
+          const int8_t i8value_ = *reinterpret_cast<const int8_t*>(vdata);
+          SetKeyInt(in[i], i8value_);
+          continue;
+        }
+        case TYPE_SMALLINT: {
+          const int16_t i16value_ = *reinterpret_cast<const int16_t*>(vdata);
+          SetKeyInt(in[i], i16value_);
+          continue;
+        }
+        case TYPE_INT: {
+          const int32_t i32value_ = *reinterpret_cast<const int32_t*>(vdata);
+          SetKeyInt(in[i], i32value_);
+          continue;
+        }
+        default: { DCHECK(false) << "invalid i32 type: " << type; }
+      };
+    }
+  }
+
+  avxsort_tuples(&in, &out, osd_itv_size);
+  for (int dx = 0; dx < osd_itv_size; ++dx)
+    localptr[osd_itv_start + dx] = GetPtr(out[dx]);
+  free(in); free(out);
+}
+
+void Sorter::TupleSorter::SortInt64(const int colidx, const int64_t bulk_start,
+  const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr ){
+
+  const std::vector<ExprContext*>& key_expr_ctxs_lhs_ = less_than_comp_.get_key_expr_ctxs_lhs_();
+  const std::vector<ExprContext*>& key_expr_ctxs_rhs_ = less_than_comp_.get_key_expr_ctxs_rhs_();
+
+  tuple_t* in; tuple_t* out;
+  posix_memalign((void**)&in, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  posix_memalign((void**)&out, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  memset(in, 0, osd_itv_size * sizeof(tuple_t));
+
+  for (int i = 0; i < osd_itv_size; ++i){
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + i];
+    void* vdata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata == NULL){
+      SetPtr(in[i], localptr[osd_itv_start + i]); SetNull(in[i], colidx);
+    } else {
+      const int64_t i64value =  *reinterpret_cast<const int64_t*>(vdata);
+      set_ptrkey_i64_hi32(in[i], localptr[osd_itv_start + i], i64value);
+    }
+  }
+
+  avxsort_tuples(&in, &out, osd_itv_size);
+  for (int dx = 0; dx < osd_itv_size; ++dx)
+    localptr[osd_itv_start + dx] = GetPtr(out[dx]);
+
+  int start_ = 0; int end_ = osd_itv_size ;
+  while( start_ < end_ ){
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + start_] ;
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata_ == NULL ) ++start_; else break;
+  }
+
+  while( start_ < end_ ){
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + end_ - 1 ] ;
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata_ == NULL ) --end_; else break;
+  }
+
+  int isd_itv_start = start_;
+  int isd_itv_size = 1;
+  for (int i = start_ + 1; i < end_; ++i) {
+    const int64_t pre_glb_row_no = bulk_start + localptr[osd_itv_start + i - 1 ] ;
+    const int64_t cur_glb_row_no = bulk_start + localptr[osd_itv_start + i ] ;
+    void* predata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, pre_glb_row_no, colidx);
+    void* curdata = GetDataByRowIdxColIdx(key_expr_ctxs_rhs_, cur_glb_row_no, colidx);
+    const int64_t prerow_i64 =  *reinterpret_cast<const int64_t*>(predata);
+    const int64_t currow_i64 =  *reinterpret_cast<const int64_t*>(curdata);
+    if ( compare_i64_hi32bit(prerow_i64, currow_i64) ) {
+      ++isd_itv_size;
+      if( i != end_ - 1) continue;
+    }
+    if (isd_itv_size > 1){
+      tuple_t* tmp_in; tuple_t* tmp_out;
+      posix_memalign((void**)&tmp_in, CACHE_LINE_SIZE, isd_itv_size* sizeof(tuple_t));
+      posix_memalign((void**)&tmp_out, CACHE_LINE_SIZE, isd_itv_size* sizeof(tuple_t));
+      memset(tmp_in, 0, isd_itv_size* sizeof(tuple_t));
+      for (int dx = 0; dx < isd_itv_size; ++dx)
+      {
+        const int64_t glb_row_no = bulk_start + localptr[ osd_itv_start + isd_itv_start + dx ];
+        void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no , colidx);
+        const int64_t currow_i64 = *reinterpret_cast<const int64_t*>(vdata_);
+        set_ptrkey_i64_lo32(tmp_in[dx], localptr[ osd_itv_start + isd_itv_start + dx ], currow_i64);
+      }
+      avxsort_tuples(&tmp_in, &tmp_out, isd_itv_size);
+      for (int dx = 0; dx < isd_itv_size; ++dx)
+        localptr[osd_itv_start + isd_itv_start + dx] = GetPtr(tmp_out[dx]);
+      free(tmp_in); free(tmp_out);
+    }
+    isd_itv_start = i;
+    isd_itv_size = 1;
+  }
+}
+
+
+void Sorter::TupleSorter::SortTime(const int colidx, const int64_t bulk_start,
+  const int isd_offset, const int isd_size, int64_t* const localptr){
+
+  const std::vector<ExprContext*>& key_expr_ctxs_lhs_ = less_than_comp_.get_key_expr_ctxs_lhs_();
+  const std::vector<ExprContext*>& key_expr_ctxs_rhs_ = less_than_comp_.get_key_expr_ctxs_rhs_();
+
+  tuple_t* tmp_in; tuple_t* tmp_out;
+  posix_memalign((void**)&tmp_in, CACHE_LINE_SIZE, isd_size* sizeof(tuple_t));
+  posix_memalign((void**)&tmp_out, CACHE_LINE_SIZE, isd_size* sizeof(tuple_t));
+  memset(tmp_in, 0, isd_size* sizeof(tuple_t));
+  for (int dx = 0; dx < isd_size; ++dx)
+  {
+    const int64_t glb_row_no = bulk_start + localptr[isd_offset + dx] ;
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no , colidx);
+    const TimestampValue* tsvalue_ = reinterpret_cast<const TimestampValue*>(vdata_);
+    int64_t i64value = 0;
+    if( tsvalue_ -> HasTime()){
+      const boost::posix_time::time_duration& time_ = tsvalue_ -> time() ;
+      i64value = time_.total_nanoseconds();
+    }
+    set_ptrkey_i64_hi32(tmp_in[dx], localptr[isd_offset + dx] , i64value);
+  }
+
+  avxsort_tuples(&tmp_in, &tmp_out, isd_size);
+  for (int dx = 0; dx < isd_size; ++dx) {
+    localptr[isd_offset + dx] = GetPtr(tmp_out[dx]);
+  }
+  free(tmp_in); free(tmp_out);
+
+  int inner_start = 0;
+  int inner_size = 1;
+
+  for (int i = 1; i < isd_offset; ++i) {
+
+    const int64_t pre_glb_row_no = bulk_start + localptr[isd_offset + i -1];
+    const int64_t cur_glb_row_no = bulk_start + localptr[isd_offset + i ];
+    void* predata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, pre_glb_row_no, colidx);
+    void* curdata = GetDataByRowIdxColIdx(key_expr_ctxs_rhs_, cur_glb_row_no, colidx);
+    const TimestampValue* pre_tsvalue_ = reinterpret_cast<const TimestampValue*>(predata);
+    const TimestampValue* cur_tsvalue_ = reinterpret_cast<const TimestampValue*>(curdata);
+    int64_t prerow_i64 = 0;
+    int64_t currow_i64 = 0;
+
+    if( pre_tsvalue_ -> HasTime()){
+      const boost::posix_time::time_duration& time_ = pre_tsvalue_ -> time() ;
+      prerow_i64 = time_.total_nanoseconds();
+    }
+
+    if( cur_tsvalue_ -> HasTime()){
+      const boost::posix_time::time_duration& time_ = cur_tsvalue_ -> time() ;
+      currow_i64 = time_.total_nanoseconds();
+    }
+
+    if ( compare_i64_hi32bit(prerow_i64, currow_i64) ) {
+         ++inner_start;
+         if( i != isd_offset - 1) continue;
+    }
+
+    if (inner_start > 1){
+      tuple_t* inner_in; tuple_t* inner_out;
+      posix_memalign((void**)&inner_in, CACHE_LINE_SIZE, inner_size* sizeof(tuple_t));
+      posix_memalign((void**)&inner_out, CACHE_LINE_SIZE, inner_size* sizeof(tuple_t));
+      memset(inner_in, 0, inner_size* sizeof(tuple_t));
+      for (int dx = 0; dx < inner_size; ++dx) {
+        const int64_t glb_row_no = bulk_start + localptr[isd_offset + inner_start + dx];
+        void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no , colidx);
+        int64_t currow_i64 = *reinterpret_cast<const int64_t*>(vdata_);
+        set_ptrkey_i64_lo32(inner_in[dx], localptr[isd_offset + inner_start + dx], currow_i64);
+      }
+      avxsort_tuples(&inner_in, &inner_out, inner_size);
+      for (int dx = 0; dx < inner_size; ++dx) {
+        localptr[isd_offset + inner_start + dx] = GetPtr(inner_out[dx]);
+      }
+      free(inner_in); free(inner_out);
+    }
+    inner_start = i;
+    inner_size = 1;
+  }
+
+
+}
+
+
+void Sorter::TupleSorter::SortTimestamp(const int colidx, const int64_t bulk_start,
+  const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr ){
+
+  const std::vector<ExprContext*>& key_expr_ctxs_lhs_ = less_than_comp_.get_key_expr_ctxs_lhs_();
+  const std::vector<ExprContext*>& key_expr_ctxs_rhs_ = less_than_comp_.get_key_expr_ctxs_rhs_();
+
+  tuple_t* in; tuple_t* out;
+  posix_memalign((void**)&in, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  posix_memalign((void**)&out, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  memset(in, 0, osd_itv_size * sizeof(tuple_t));
+
+  for (int i = 0; i < osd_itv_size; ++i){
+    SetPtr(in[i], localptr[osd_itv_start + i]);
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + i];
+    void* vdata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx );
+    if( vdata == NULL){
+       SetNull(in[i], colidx);
+    } else {
+      const TimestampValue* ts_value = reinterpret_cast<const TimestampValue*>(vdata);
+      int i32date = 0; // WARNING: 32bit integer may be not long enough
+      if( ts_value -> HasDate() ) {
+        const boost::gregorian::date& date_ = ts_value -> date();
+        i32date = date_.day_number();
+      }else {
+        i32date = INT_MAX;
+      }
+      SetKeyInt(in[i], i32date);
+    }
+  }
+
+  avxsort_tuples(&in, &out, osd_itv_size);
+  for (int i = 0; i < osd_itv_size; ++i) {
+    localptr[osd_itv_start + i] = GetPtr(out[i]);
+  }
+  free(in); free(out);
+
+  int start_ = 0; int end_ = osd_itv_size;
+  while( start_ < end_ ){
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + start_] ;
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx );
+    if( vdata_ == NULL ) ++start_; else break;
+  }
+
+  while( start_ < end_ ){
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + end_ -1] ;
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx );
+    if( vdata_ == NULL ) --end_; else break;
+  }
+
+  int isd_itv_start = start_;
+  int isd_itv_size = 1;
+
+  for (int i = start_ + 1; i < end_; ++i) {
+
+    const int64_t pre_glb_row_no = bulk_start + localptr[osd_itv_start + i -1] ;
+    const int64_t cur_glb_row_no = bulk_start + localptr[osd_itv_start + i ];
+    void* predata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, pre_glb_row_no, colidx );
+    void* curdata = GetDataByRowIdxColIdx(key_expr_ctxs_rhs_, cur_glb_row_no, colidx );
+
+    int pre_i32date = INT_MAX;
+    int cur_i32date = INT_MAX;
+    const TimestampValue* pre_ts_value = reinterpret_cast<const TimestampValue*>(predata);
+    const TimestampValue* cur_ts_value = reinterpret_cast<const TimestampValue*>(curdata);
+    if( pre_ts_value->HasDate() ) pre_i32date = (pre_ts_value -> date()).day_number();
+    if( cur_ts_value->HasDate() ) cur_i32date = (cur_ts_value -> date()).day_number();
+
+    if( pre_i32date == cur_i32date ) {
+      ++isd_itv_size;
+      if( i != end_ - 1) continue;
+    }
+
+    if (isd_itv_size > 1){
+      const int isd_offset = osd_itv_start + isd_itv_start;
+      SortTime(colidx, bulk_start, isd_offset, isd_itv_size, localptr );
+    }
+    isd_itv_start = i;
+    isd_itv_size = 1;
+  }
+
+}
+
+
+void Sorter::TupleSorter::SortFloat(const int colidx, const int64_t bulk_start,
+  const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr ) {
+
+  const std::vector<ExprContext*>& key_expr_ctxs_lhs_ = less_than_comp_.get_key_expr_ctxs_lhs_();
+  tuple_t* in; tuple_t* out;
+  posix_memalign((void**)&in, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  posix_memalign((void**)&out, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  memset(in, 0, osd_itv_size * sizeof(tuple_t));
+
+  for (int i = 0; i < osd_itv_size; ++i){
+    SetPtr(in[i], localptr[osd_itv_start + i]);
+    void* vdata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, bulk_start + localptr[osd_itv_start + i], colidx );
+    if(vdata == NULL){
+      SetNull(in[i], colidx);
+    } else {
+      const float f32value_ = *reinterpret_cast<const float*>(vdata);
+      SetKeyFloat(in[i], f32value_);
+    }
+  }
+
+  avxsort_tuples(&in, &out, osd_itv_size);
+  for (int i = 0; i < osd_itv_size; ++i) {
+    localptr[osd_itv_start + i] = GetPtr(out[i]);
+  }
+  free(in); free(out);
+
+}
+
+void Sorter::TupleSorter::SortDouble(const int colidx, const int64_t bulk_start,
+  const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr ){
+
+  const std::vector<ExprContext*>& key_expr_ctxs_lhs_ = less_than_comp_.get_key_expr_ctxs_lhs_();
+  const std::vector<ExprContext*>& key_expr_ctxs_rhs_ = less_than_comp_.get_key_expr_ctxs_rhs_();
+
+  tuple_t* in; tuple_t* out;
+  posix_memalign((void**)&in, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  posix_memalign((void**)&out, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  memset(in, 0, osd_itv_size * sizeof(tuple_t));
+
+  for (int i = 0; i < osd_itv_size; ++i) {
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + i];
+    void* vdata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx );
+    if( vdata == NULL){
+      SetPtr(in[i], localptr[osd_itv_start + i]); SetNull(in[i], colidx);
+    } else {
+      double d64value =  *reinterpret_cast<const double*>(vdata);
+      set_ptrkey_for_d64_hi32bit(in[i], localptr[osd_itv_start + i], d64value);
+    }
+  }
+
+  avxsort_tuples(&in, &out, osd_itv_size);
+  for (int i = 0; i < osd_itv_size; ++i) {
+    localptr[osd_itv_start + i] = GetPtr(out[i]);
+  }
+  free(in); free(out);
+
+  int start_ = 0; int end_ = osd_itv_size ;
+  while( start_ < end_ ){
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + start_] ;
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx );
+    if( vdata_ == NULL ) ++start_; else break;
+  }
+
+  while( start_ < end_ ){
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + end_ - 1];
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no , colidx );
+    if( vdata_ == NULL ) --end_; else break;
+  }
+
+  int isd_itv_start = start_;
+  int isd_itv_size = 1;
+  for (int i = start_ + 1 ; i < end_; ++i) {
+
+    const int64_t pre_glb_row_no = bulk_start + localptr[osd_itv_start + i - 1];
+    const int64_t cur_glb_row_no = bulk_start + localptr[osd_itv_start + i];
+
+    void* pre_data = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, pre_glb_row_no, colidx);
+    void* cur_data = GetDataByRowIdxColIdx(key_expr_ctxs_rhs_, cur_glb_row_no, colidx);
+    const double prerow_i64 =  *reinterpret_cast<const double*>(pre_data);
+    const double currow_i64 =  *reinterpret_cast<const double*>(cur_data);
+
+    if ( compare_d64_hi32bit( prerow_i64 , currow_i64) ) {
+      ++isd_itv_size;
+      if( i != end_ - 1 ) continue;
+    }
+
+    if (isd_itv_size > 1){
+      tuple_t* tmp_in; tuple_t* tmp_out;
+      posix_memalign((void**)&tmp_in, CACHE_LINE_SIZE, isd_itv_size* sizeof(tuple_t));
+      posix_memalign((void**)&tmp_out, CACHE_LINE_SIZE, isd_itv_size* sizeof(tuple_t));
+      memset(tmp_in, 0, isd_itv_size * sizeof(tuple_t));
+
+      for (int dx = 0; dx < isd_itv_size; ++dx) {
+        const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + isd_itv_start + dx ] ;
+        void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no , colidx);
+        double currow_d64 = *reinterpret_cast<const double*>(vdata_);
+        set_ptrkey_for_d64_lo20bit(tmp_in[dx], localptr[osd_itv_start + isd_itv_start + dx ] , currow_d64);
+      }
+      avxsort_tuples(&tmp_in, &tmp_out, isd_itv_size);
+      for (int i = 0; i < isd_itv_size; ++i) {
+        localptr[osd_itv_start + isd_itv_start + i] = GetPtr(tmp_out[i]);
+      }
+      free(in); free(out);
+    }
+    isd_itv_start = i;
+    isd_itv_start = 1;
+  }
+}
+
+
+void Sorter::TupleSorter::SortStringVarchar(const int colidx, const int64_t bulk_start,
+  const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr ){
+
+  const std::vector<ExprContext*>& key_expr_ctxs_lhs_ = less_than_comp_.get_key_expr_ctxs_lhs_();
+  const std::vector<ExprContext*>& key_expr_ctxs_rhs_ = less_than_comp_.get_key_expr_ctxs_rhs_();
+
+  int char_offset = 0;
+  int char_length_max = 0;
+  const int const_char_width = 4;
+
+  tuple_t* in; tuple_t* out;
+  posix_memalign((void**)&in, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  posix_memalign((void**)&out, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  memset(in, 0, osd_itv_size * sizeof(tuple_t));
+
+  for (int i = 0; i < osd_itv_size; ++i){
+    SetPtr(in[i], localptr[osd_itv_start + i]);
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + i];
+    void* vdata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata == NULL){
+      SetNull(in[i], colidx);
+    } else {
+      const StringValue* strval = reinterpret_cast<const StringValue*>(vdata);
+      if(strval->len > char_length_max) char_length_max = strval->len;
+      int length_ = strval -> len - char_offset < const_char_width? strval -> len - char_offset : const_char_width;
+      int i32key = trans_4char_to_int( strval->ptr , length_);
+      SetKeyInt(in[i], i32key);
+    }
+  }
+
+  avxsort_tuples(&in, &out, osd_itv_size);
+  for (int i = 0; i < osd_itv_size; ++i) {
+    localptr[osd_itv_start + i] = GetPtr(out[i]);
+  }
+  free(in); free(out);
+
+
+  int start_ = 0; int end_ = osd_itv_size ;
+  while( start_ < end_ ){
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + start_] ;
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata_ == NULL ) ++start_; else break;
+  }
+
+  while( start_ < end_ ){
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + end_ -1] ;
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata_ == NULL ) --end_; else break;
+  }
+
+  for (int dx = 1; dx < ceil(static_cast<double>(char_length_max)/ const_char_width); ++dx)
+  {
+    bool should_continue = false;
+    int isd_itv_start = start_;
+    int isd_itv_size = 1;
+    //const int pre_4char_offset = char_offset;
+    char_offset = char_offset + const_char_width;
+    int dy = start_ + 1;
+    for ( ; dy < end_; ++dy) {
+
+      void* predata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, bulk_start + localptr[osd_itv_start + dy -1], colidx);
+      void* curdata = GetDataByRowIdxColIdx(key_expr_ctxs_rhs_, bulk_start + localptr[osd_itv_start + dy], colidx);
+      const StringValue* prestrval = reinterpret_cast<const StringValue*>(predata);
+      const StringValue* curstrval = reinterpret_cast<const StringValue*>(curdata);
+      if( prestrval->len < char_offset || curstrval->len < char_offset ) continue;
+
+      if( impala::StringCompare(prestrval->ptr, prestrval->len, curstrval->ptr, curstrval->len, char_offset) == 0 ) {
+        ++isd_itv_size;
+        if( dy != end_ - 1 ) continue;
+      }
+
+
+      if (isd_itv_size > 1){
+        should_continue = true;
+        tuple_t* tmp_in; tuple_t* tmp_out;
+        posix_memalign((void**)&tmp_in, CACHE_LINE_SIZE, isd_itv_size* sizeof(tuple_t));
+        posix_memalign((void**)&tmp_out, CACHE_LINE_SIZE, isd_itv_size* sizeof(tuple_t));
+        memset(tmp_in, 0, isd_itv_size * sizeof(tuple_t));
+
+        for (int dz = 0; dz < isd_itv_size; ++dz)
+        {
+          const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + isd_itv_start + dz ] ;
+          void* vdata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+          const StringValue* curstrval = reinterpret_cast<const StringValue*>(vdata);
+          int length_ = curstrval->len - char_offset < const_char_width? curstrval->len - char_offset : const_char_width;
+          int currow_i32value = 0;
+          if( length_ > 0) currow_i32value = trans_4char_to_int( curstrval->ptr + char_offset, length_ );
+
+          SetPtr(tmp_in[dz], localptr[osd_itv_start + isd_itv_start + dz ]);
+          SetKeyInt(tmp_in[dz], currow_i32value);
+        }
+        avxsort_tuples(&tmp_in, &tmp_out, isd_itv_size);
+
+        for (int dz = 0; dz < isd_itv_size; ++dz)
+          localptr[osd_itv_start + isd_itv_start + dz ] = GetPtr(tmp_out[dz]);
+        free(tmp_in); free(tmp_out);
+      }
+
+      isd_itv_start = dy;
+      isd_itv_size = 1;
+
+    }
+
+    if( !should_continue ) break;
+
+  }
+
+}
+
+void Sorter::TupleSorter::SortChar(const int colidx, const ColumnType& type, const int64_t bulk_start,
+  const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr ){
+
+  const std::vector<ExprContext*>& key_expr_ctxs_lhs_ = less_than_comp_.get_key_expr_ctxs_lhs_();
+  const std::vector<ExprContext*>& key_expr_ctxs_rhs_ = less_than_comp_.get_key_expr_ctxs_rhs_();
+  int char_offset = 0;
+  int char_length_max = 0;
+  const int const_char_width = 4;
+
+  tuple_t* in; tuple_t* out;
+  posix_memalign((void**)&in, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  posix_memalign((void**)&out, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  memset(in, 0, osd_itv_size * sizeof(tuple_t));
+
+  for (int i = 0; i < osd_itv_size; ++i){
+    SetPtr(in[i], localptr[osd_itv_start + i]);
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + i];
+    void* vdata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata == NULL){
+       SetNull(in[i], colidx);
+    } else {
+      const char* str_ptr = StringValue::CharSlotToPtr(vdata, type);
+      const int64_t len_ = StringValue::UnpaddedCharLength(str_ptr, type.len);
+      if(len_ > char_length_max) char_length_max = len_;
+      const int length_ = len_ - char_offset < const_char_width? len_ - char_offset : const_char_width;
+      const int i32key = trans_4char_to_int( str_ptr , length_);
+      SetKeyInt(in[i], i32key);
+    }
+  }
+
+  avxsort_tuples(&in, &out, osd_itv_size);
+  for (int i = 0; i < osd_itv_size; ++i) {
+    localptr[osd_itv_start + i] = GetPtr(out[i]);
+  }
+  free(in); free(out);
+
+  int start_ = 0; int end_ = osd_itv_size ;
+  while( start_ < end_ ){
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + start_] ;
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata_ == NULL ) ++start_; else break;
+  }
+
+  while( start_ < end_  ){
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + end_ -1] ;
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata_ == NULL ) --end_; else break;
+  }
+
+
+  for (int dx = 1; dx < ceil((double) char_length_max / const_char_width); ++dx)
+  {
+    bool should_continue = false;
+    int isd_itv_start = start_;
+    int isd_itv_size = 1;
+    //const int pre_4char_offset = char_offset;
+    char_offset = char_offset + const_char_width;
+    for (int dy = start_ + 1; dy < end_; ++dy) {
+
+      void* predata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, bulk_start + localptr[osd_itv_start + dy -1], colidx);
+      void* curdata = GetDataByRowIdxColIdx(key_expr_ctxs_rhs_, bulk_start + localptr[osd_itv_start + dy], colidx);
+      const char* const cur_str_ptr = StringValue::CharSlotToPtr(curdata, type);
+      const char* const pre_str_ptr = StringValue::CharSlotToPtr(predata, type);
+      const int pre_len_ = StringValue::UnpaddedCharLength(pre_str_ptr, type.len);
+      const int cur_len_ = StringValue::UnpaddedCharLength(cur_str_ptr, type.len);
+      if( pre_len_ < char_offset || cur_len_< char_offset ) continue;
+      if( impala::StringCompare(cur_str_ptr, pre_len_, pre_str_ptr, cur_len_, char_offset) == 0 ) {
+        ++isd_itv_size;
+        if ( dy != end_ - 1 ) continue;
+      }
+
+      if (isd_itv_size > 1){
+        should_continue = true;
+        tuple_t* tmp_in; tuple_t* tmp_out;
+        posix_memalign((void**)&tmp_in, CACHE_LINE_SIZE, isd_itv_size* sizeof(tuple_t));
+        posix_memalign((void**)&tmp_out, CACHE_LINE_SIZE, isd_itv_size* sizeof(tuple_t));
+        memset(tmp_in, 0, isd_itv_size * sizeof(tuple_t));
+
+        for (int dz = 0; dz < isd_itv_size; dz++) {
+
+          const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + isd_itv_start + dz ] ;
+          void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+          const char* str_ptr = StringValue::CharSlotToPtr(vdata_, type);
+          const int64_t len_ = StringValue::UnpaddedCharLength(str_ptr, type.len);
+          const int length_ = len_ - char_offset < const_char_width? len_ - char_offset : const_char_width;
+          int currow_i32value = 0;
+          if( length_ > 0) currow_i32value = trans_4char_to_int( str_ptr + char_offset, length_ );
+          SetPtr(tmp_in[dz], localptr[osd_itv_start + isd_itv_start + dz ]);
+          SetKeyInt(tmp_in[dz], currow_i32value);
+        }
+        avxsort_tuples(&tmp_in, &tmp_out, isd_itv_size);
+        for (int dz = 0; dz < isd_itv_size; ++dz)
+          localptr[osd_itv_start + isd_itv_start + dz ] = GetPtr(tmp_out[dz]);
+        free(tmp_in); free(tmp_out);
+      }
+      isd_itv_start = dy;
+      isd_itv_size = 1;
+    }
+
+    if( !should_continue ) break;
+  }
+}
+
+void Sorter::TupleSorter::SortDecimal4Value(const int width, const int colidx, const int64_t bulk_start,
+  const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr ){
+  const std::vector<ExprContext*>& key_expr_ctxs_lhs_ = less_than_comp_.get_key_expr_ctxs_lhs_();
+  tuple_t* in; tuple_t* out;
+  posix_memalign((void**)&in, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  posix_memalign((void**)&out, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  memset(in, 0, osd_itv_size * sizeof(tuple_t));
+
+  for (int i = 0; i < osd_itv_size; ++i){
+    SetPtr(in[i], localptr[osd_itv_start + i]);
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + i];
+    void* vdata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if (vdata == NULL) {
+      SetNull(in[i], colidx);
+    } else {
+      const Decimal4Value dec4val =  *reinterpret_cast<const Decimal4Value*>(vdata);
+      SetKeyInt(in[i], (int32_t)dec4val.value());
+    }
+  }
+  avxsort_tuples(&in, &out, osd_itv_size);
+  for (int i = 0; i < osd_itv_size; ++i)
+    localptr[osd_itv_start + i] = GetPtr(out[i]);
+  free(in); free(out);
+}
+
+
+void Sorter::TupleSorter::SortDecimal8Value(const int width, const int colidx, const int64_t bulk_start,
+  const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr ){
+  const std::vector<ExprContext*>& key_expr_ctxs_lhs_ = less_than_comp_.get_key_expr_ctxs_lhs_();
+  const std::vector<ExprContext*>& key_expr_ctxs_rhs_ = less_than_comp_.get_key_expr_ctxs_rhs_();
+
+  tuple_t* in; tuple_t* out;
+  posix_memalign((void**)&in, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  posix_memalign((void**)&out, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  memset(in, 0, osd_itv_size * sizeof(tuple_t));
+
+  for (int i = 0; i < osd_itv_size; ++i) {
+    SetPtr(in[i], localptr[osd_itv_start + i]);
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + i];
+    const void* const vdata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata == NULL){
+      SetNull(in[i], colidx);
+    } else {
+      const Decimal8Value dec8val =  *reinterpret_cast<const Decimal8Value*>(vdata);
+      set_ptrkey_i64_hi32(in[i], localptr[osd_itv_start + i], dec8val.value());
+    }
+  }
+  avxsort_tuples(&in, &out, osd_itv_size);
+  for (int i = 0; i < osd_itv_size; ++i) {
+    localptr[osd_itv_start + i] = GetPtr(out[i]);
+  }
+  free(in); free(out);
+
+  int start_ = 0; int end_ = osd_itv_size ;
+  while( start_ < end_ ){
+    const int64_t glb_row_no = bulk_start + localptr[ osd_itv_start + start_] ;
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata_ == NULL ) ++start_; else break;
+  }
+
+  while( start_ < end_ ){
+    const int64_t glb_row_no = bulk_start + localptr[ osd_itv_start + end_ - 1];
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata_ == NULL ) --end_; else break;
+  }
+
+  int isd_itv_start = start_;
+  int isd_itv_size = 1;
+
+  for (int i = start_ + 1; i < end_; ++i) {
+
+    const int64_t pre_glb_row_no = bulk_start + localptr[osd_itv_start + i];
+    const int64_t cur_glb_row_no = bulk_start + localptr[osd_itv_start + i-1];
+    void* predata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, pre_glb_row_no, colidx);
+    void* curdata = GetDataByRowIdxColIdx(key_expr_ctxs_rhs_, cur_glb_row_no, colidx);
+
+    const Decimal8Value pre_dec8val =  *reinterpret_cast<const Decimal8Value*>(predata);
+    const Decimal8Value cur_dec8val =  *reinterpret_cast<const Decimal8Value*>(curdata);
+    const int64_t prerow_i64 = static_cast<int64_t>(pre_dec8val.value());
+    const int64_t currow_i64 = static_cast<int64_t>(cur_dec8val.value());
+
+    if ( compare_i64_hi32bit(prerow_i64 , currow_i64) ) {
+         ++isd_itv_size;
+         if( i != end_ - 1) continue;
+    }
+
+    if (isd_itv_size > 1){
+      tuple_t* tmp_in; tuple_t* tmp_out;
+      posix_memalign((void**)&tmp_in, CACHE_LINE_SIZE, isd_itv_size* sizeof(tuple_t));
+      posix_memalign((void**)&tmp_out, CACHE_LINE_SIZE, isd_itv_size* sizeof(tuple_t));
+      memset(tmp_in, 0, isd_itv_size * sizeof(tuple_t));
+
+      for (int dx = 0; dx < isd_itv_size; ++dx)
+      {
+        const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + isd_itv_start + dx] ;
+        void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+        const Decimal8Value dec8val =  *reinterpret_cast<const Decimal8Value*>(vdata_);
+        set_ptrkey_i64_lo32(tmp_in[dx], localptr[osd_itv_start + isd_itv_start + dx] , dec8val.value());
+      }
+
+      avxsort_tuples(&tmp_in, &tmp_out, isd_itv_size);
+      for (int i = 0; i < osd_itv_size; ++i) {
+        localptr[osd_itv_start + isd_itv_start + i] = GetPtr(tmp_out[i]);
+      }
+      free(tmp_in); free(tmp_out);
+    }
+    isd_itv_start = i;
+    isd_itv_size = 1;
+  }
+}
+
+
+void Sorter::TupleSorter::SortDecimal16Value(const int width, const int colidx, const int64_t bulk_start,
+  const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr ){
+  const std::vector<ExprContext*>& key_expr_ctxs_lhs_ = less_than_comp_.get_key_expr_ctxs_lhs_();
+  const std::vector<ExprContext*>& key_expr_ctxs_rhs_ = less_than_comp_.get_key_expr_ctxs_rhs_();
+
+  tuple_t* in; tuple_t* out;
+  posix_memalign((void**)&in, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  posix_memalign((void**)&out, CACHE_LINE_SIZE, osd_itv_size* sizeof(tuple_t));
+  memset(in, 0, osd_itv_size * sizeof(tuple_t));
+
+  for (int i = 0; i < osd_itv_size; ++i){
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + i];
+    void* vdata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata == NULL){
+      SetPtr(in[i], localptr[osd_itv_start + i]); SetNull(in[i], colidx);
+    } else {
+      const Decimal16Value dec16val =  *reinterpret_cast<const Decimal16Value*>(vdata);
+      const int128_t i128value = dec16val.value();
+      set_ptrkey_i128_127_96(in[i], localptr[osd_itv_start + i], i128value);
+    }
+  }
+  avxsort_tuples(&in, &out, osd_itv_size);
+  for (int dx = 0; dx < osd_itv_size; ++dx) {
+    localptr[osd_itv_start + dx] = GetPtr(out[dx]);
+  }
+  free(in); free(out);
+
+  int start = 0; int end = osd_itv_size ;
+  while( start < end ){
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + start ];
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata_ == NULL ) ++start; else break;
+  }
+  while( start < end ){
+    const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + end -1 ];
+    void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+    if( vdata_ == NULL ) --end; else break;
+  }
+
+
+  for (int phi = 0; phi < 3; ++phi)
+  {
+    int isd_itv_start = start;
+    int isd_itv_size = 1;
+    bool should_repeat = false;
+
+    for (int i = start + 1; i < end; ++i) {
+      void* predata = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, bulk_start + localptr[osd_itv_start + i - 1], colidx);
+      void* curdata = GetDataByRowIdxColIdx(key_expr_ctxs_rhs_, bulk_start + localptr[osd_itv_start + i], colidx);
+
+      const Decimal16Value pre_dec16val =  *reinterpret_cast<const Decimal16Value*>(predata);
+      const Decimal16Value cur_dec16val =  *reinterpret_cast<const Decimal16Value*>(curdata);
+
+      const int128_t prerow_i128 = pre_dec16val.value();
+      const int128_t currow_i128 = cur_dec16val.value();
+
+      bool switch_ = true;
+      if (phi == 0) {
+        switch_ = compare_i128_hi127_96bit(prerow_i128, currow_i128);
+      } else if (phi == 1) {
+        switch_ = compare_i128_hi127_64bit(prerow_i128, currow_i128);
+      } else if (phi == 2) {
+        switch_ = compare_i128_hi127_32bit(prerow_i128, currow_i128);
+      }
+
+      if ( switch_ ) {
+        ++isd_itv_size;
+        if( i != end - 1 ) continue;
+      }
+
+      if (isd_itv_size > 1){
+        should_repeat = true;
+        tuple_t* tmp_in; tuple_t* tmp_out;
+        posix_memalign((void**)&tmp_in, CACHE_LINE_SIZE, isd_itv_size* sizeof(tuple_t));
+        posix_memalign((void**)&tmp_out, CACHE_LINE_SIZE, isd_itv_size* sizeof(tuple_t));
+        memset(tmp_in, 0, isd_itv_size * sizeof(tuple_t));
+
+        for (int dx = 0; dx < isd_itv_size; dx++)
+        {
+          const int64_t glb_row_no = bulk_start + localptr[osd_itv_start + isd_itv_start + dx] ;
+          void* vdata_ = GetDataByRowIdxColIdx(key_expr_ctxs_lhs_, glb_row_no, colidx);
+          const Decimal16Value dec16_val =  *reinterpret_cast<const Decimal16Value*>(vdata_);
+          if (phi == 0) {
+            set_ptrkey_i128_95_64(tmp_in[dx], localptr[osd_itv_start + isd_itv_start + dx], dec16_val.value());
+          } else if (phi == 1) {
+            set_ptrkey_i128_63_32(tmp_in[dx], localptr[osd_itv_start + isd_itv_start + dx], dec16_val.value());
+          } else if (phi == 2) {
+            set_ptrkey_i128_31_0(tmp_in[dx], localptr[osd_itv_start + isd_itv_start + dx], dec16_val.value());
+          }
+
+        }
+        avxsort_tuples(&tmp_in, &tmp_out, isd_itv_size);
+        for (int dx = 0; dx < isd_itv_size; ++dx) {
+          localptr[osd_itv_start + isd_itv_start + dx] = GetPtr(tmp_out[dx]);
+        }
+        free(tmp_in); free(tmp_out);
+      }
+      isd_itv_start = i;
+      isd_itv_size = 1;
+    }
+
+    if( !should_repeat ) break;
+  }
+
+}
+
+
+void Sorter::TupleSorter::SortDecimal(const int width, const int colidx, const int64_t bulk_start,
+  const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr ){
+  switch( width ){
+    case 4: {
+      SortDecimal4Value( width, colidx, bulk_start, osd_itv_start, osd_itv_size, localptr );
+      return;
+    }
+    case 8: {
+      SortDecimal8Value( width, colidx, bulk_start, osd_itv_start, osd_itv_size, localptr );
+      return;
+    }
+    case 16: {
+      SortDecimal16Value( width, colidx, bulk_start, osd_itv_start, osd_itv_size, localptr );
+      return;
+    }
+  }
+}
+
+void Sorter::TupleSorter::SorterCore(const int colidx, const int64_t bulk_start,
+  const int64_t osd_itv_start, const int64_t osd_itv_size, int64_t* const localptr ){
+
+  const std::vector<ExprContext*>& key_expr_ctxs_lhs_ = less_than_comp_.get_key_expr_ctxs_lhs_();
+  const ColumnType& type = key_expr_ctxs_lhs_[colidx]->root()->type();
+
+  switch ( type.type ) {
+    case TYPE_NULL: {
+      return;
+    }
+    case TYPE_BOOLEAN:
+    case TYPE_TINYINT:
+    case TYPE_SMALLINT:
+    case TYPE_INT: {
+      SortInt32(colidx, bulk_start, osd_itv_start, osd_itv_size, localptr, type);
+      return;
+    }
+    case TYPE_BIGINT: {
+      SortInt64(colidx, bulk_start, osd_itv_start, osd_itv_size, localptr);
+      return;
+    }
+    case TYPE_FLOAT: {
+      SortFloat(colidx, bulk_start, osd_itv_start, osd_itv_size, localptr);
+      return;
+    }
+    case TYPE_DOUBLE:
+    {
+      SortDouble(colidx, bulk_start, osd_itv_start, osd_itv_size, localptr);
+      return;
+    }
+    case TYPE_STRING:
+    case TYPE_VARCHAR:
+    {
+      SortStringVarchar( colidx, bulk_start, osd_itv_start, osd_itv_size, localptr );
+      return ;
+    }
+    case TYPE_CHAR:
+    {
+      SortChar( colidx, type, bulk_start, osd_itv_start, osd_itv_size, localptr );
+      return ;
+    }
+
+    case TYPE_TIMESTAMP:
+    {
+      SortTimestamp(colidx, bulk_start, osd_itv_start, osd_itv_size, localptr );
+      return;
+    }
+    case TYPE_DECIMAL:
+    {
+      switch (type.GetByteSize()) {
+        case 4:
+          SortDecimal(4, colidx, bulk_start, osd_itv_start, osd_itv_size,localptr );
+          return;
+        case 8:
+          SortDecimal(8, colidx, bulk_start, osd_itv_start, osd_itv_size, localptr );
+          return;
+        case 16:
+          SortDecimal(16, colidx, bulk_start, osd_itv_start, osd_itv_size, localptr );
+          return;
+        default:
+          DCHECK(false) << "invalid TYPE_DECIMAL: " << type;
+          return;
+      }
+      return;
+    }
+    default:
+      DCHECK(false) << "invalid type: " << type.DebugString();
+      return;
+    };
+}
+
+bool Sorter::TupleSorter::SortNthColumn(int ColIdx, const int64_t bulk_start,
+  const int bulk_size,  const bool asc_sort, int64_t* const localptr) {
+  const std::vector<ExprContext*>& key_expr_ctxs_lhs_ =
+      less_than_comp_.get_key_expr_ctxs_lhs_();
+  if (ColIdx == 0) {
+    SorterCore(ColIdx, bulk_start, 0, bulk_size, localptr);
+    if (!asc_sort) reverse(localptr, localptr + bulk_size);
+    return true;
+
+  } else {
+    bool should_sort = false;
+    int interval_start = 0;
+    int interval_size = 1;
+
+    for (int i = 1; i < bulk_size; ++i) {
+      TupleIterator _pre_iter = TupleIterator(this, bulk_start + localptr[i - 1]);
+      TupleIterator _cur_iter = TupleIterator(this, bulk_start + localptr[i]);
+      TupleRow* _pre_row = reinterpret_cast<TupleRow*>(&_pre_iter.current_tuple_);
+      TupleRow* _cur_row = reinterpret_cast<TupleRow*>(&_cur_iter.current_tuple_);
+      if (less_than_comp_.prefix_equal_n(_cur_row, _pre_row, ColIdx)) {
+        ++interval_size;
+        if( i != bulk_size - 1) continue;
+      }
+
+      if (interval_size > 1) {
+        should_sort = true;
+        SorterCore(ColIdx, bulk_start, interval_start, interval_size, localptr);
+        if (!asc_sort)  reverse(localptr + interval_start, localptr + interval_start + interval_size);
+      }
+      interval_start = i;
+      interval_size = 1;
+    }
+    return should_sort;
+  }
+}
+
+
+void Sorter::TupleSorter::Sort(Run* run) {
+  LOG(INFO) << "[dbg] start sorting@" << __LINE__ ;
+  const int bulk_size = 1 << 20;
+  struct timeval tvstart, tv_inbulk_sort, tv_bulk_merge, tv_shuffle, tvend;
+  run_ = run;
+  const std::vector<ExprContext*>& key_expr_ctxs_lhs_ = less_than_comp_.get_key_expr_ctxs_lhs_();
+  const std::vector<bool>& is_asc_ = less_than_comp_.get_is_asc_();
+  bool UseDefaultSort = false;
+
+  LOG(INFO) << "[dbg] start sorting@" << __LINE__ ;
+  if (!CpuInfo::IsSupported(CpuInfo::AVX2)) UseDefaultSort = true;
+
+ // UseDefaultSort = true; // override this setting for experiment;
+  gettimeofday(&tvstart, NULL);
+  const int64_t nitems = run_->num_tuples_;
+  if (!UseDefaultSort) {
+    int64_t* const global_ptr = new int64_t[nitems];
+    LOG(INFO) << "[dbg] inbulk sorting @" << __LINE__ ;
+
+    const int64_t bulk_num = (int64_t)ceil((double)nitems / bulk_size);
+    for (int64_t i = 0; i < nitems; i++) global_ptr[i] = i;
+    for (int64_t bulkcur = 0; bulkcur < bulk_num; ++bulkcur) {
+      int col_idx = 0;
+      const int64_t cur_bulk_start = bulkcur * bulk_size;
+      const int cur_bulk_size = nitems - cur_bulk_start < bulk_size ? nitems - cur_bulk_start : bulk_size;
+      int64_t* const localptr = new int64_t[cur_bulk_size];
+      for (int dx = 0; dx < cur_bulk_size; ++dx) localptr[dx] = dx;
+      const int ncolumns = key_expr_ctxs_lhs_.size();
+      do {
+        bool asc_sort = is_asc_[col_idx];
+        bool NeedMoreSort = SortNthColumn(col_idx++, cur_bulk_start, cur_bulk_size, asc_sort, localptr);
+        if (NeedMoreSort && (col_idx < ncolumns)) continue;
+        else break;
+      } while (col_idx < ncolumns);
+      for (int dx = 0; dx < cur_bulk_size; ++dx) {
+        global_ptr[cur_bulk_start + dx] = cur_bulk_start + (int64_t)localptr[dx];
+      }
+      delete localptr;
+    }
+    LOG(INFO) << "[dbg] inbulk sorting @" << __LINE__ ;
+    gettimeofday(&tv_inbulk_sort, NULL);
+    mycomparison com_obj;
+    com_obj.set_comparator( &less_than_comp_ );
+    com_obj.set_tuple_sorter( this );
+    vector< std::pair<int64_t, int64_t> > idx_vector;
+    std::make_heap(idx_vector.begin(), idx_vector.end(), com_obj);
+
+    int64_t* const heap_out = new int64_t[nitems];
+    int64_t* const heap_cur = new int64_t[bulk_num];
+    memset(heap_cur, 0, sizeof(int64_t) * bulk_num);
+
+    for (int64_t dx = 0; dx < bulk_num; ++dx) {
+      const int64_t glb_row_no = global_ptr[dx * bulk_size];
+      idx_vector.push_back( make_pair(glb_row_no, dx ) );
+      std::push_heap(idx_vector.begin(), idx_vector.end(), com_obj);
+     // ++heap_cur[dx];
+    }
+
+    for( int64_t dx = 0; dx < nitems; ++dx ){
+      pair<int64_t, int64_t> glbrow_bulkno = idx_vector.front();
+      heap_out[dx] = glbrow_bulkno.first;
+
+      std::pop_heap(idx_vector.begin(), idx_vector.end(), com_obj);
+      idx_vector.pop_back();
+
+      int64_t which_bulk = glbrow_bulkno.second;
+      heap_cur[which_bulk]++;
+
+      int64_t bulk_bound;
+      if( (which_bulk + 1) * bulk_size < nitems) bulk_bound = bulk_size ;
+      else bulk_bound = nitems - which_bulk * bulk_size ;
+
+      if( heap_cur[which_bulk] < bulk_bound ) {
+        const int64_t glb_row_no = global_ptr[which_bulk * bulk_size + heap_cur[which_bulk]] ;
+        idx_vector.push_back( make_pair(glb_row_no , which_bulk) );
+        std::push_heap(idx_vector.begin(), idx_vector.end(), com_obj);
+      }
+
+    }
+    gettimeofday(&tv_bulk_merge, NULL);
+    LOG(INFO) << "[dbg] bulk merge done@" << __LINE__ ;
+     // Final phase: shuffle
+
+    uint8_t* temp_data_seg = (uint8_t*)malloc(tuple_size_ * nitems);
+    for (int64_t i = 0; i < nitems; ++i) {
+      uint8_t* src = TupleIterator(this, heap_out[i]).current_tuple_;
+      memcpy(temp_data_seg + i * tuple_size_, src, tuple_size_);
+    }
+    for (int64_t i = 0; i < nitems; ++i) {
+      uint8_t* dst = TupleIterator(this, i).current_tuple_;
+      memcpy(dst, temp_data_seg + i * tuple_size_, tuple_size_);
+    }
+
+    free(temp_data_seg);
+    LOG(INFO) << "[dbg] shuffle done@" << __LINE__ ;
+
+    delete heap_out;
+    delete heap_cur;
+    delete global_ptr;
+    gettimeofday(&tv_shuffle, NULL);
+  } else {
+    SortHelper(TupleIterator(this, 0), TupleIterator(this, run_->num_tuples_));
+    LOG(INFO) << "[dbg] impala sort done@" << __LINE__ ;
+
+  }
+  LOG(INFO) << "[dbg] all done@" << __LINE__ ;
+
+  run->is_sorted_ = true;
+  gettimeofday(&tvend, NULL);
+  if( UseDefaultSort ){
+    long t_total = (tvend.tv_sec - tvstart.tv_sec) * 1000000 +
+                   (tvend.tv_usec - tvstart.tv_usec);
+    LOG(INFO) << "[dbg] time consumed in impala sort  " << t_total << " microsecond";
+    LOG(INFO) << "[dbg] impala sort throughput  " <<  (double) nitems / (double)t_total * 1000000 << " tuples/second";
+
+  }else {
+    LOG(INFO) << "[dbg] sorting row number: " << run_->num_tuples_;
+    long t_bulkstort = (tv_inbulk_sort.tv_sec - tvstart.tv_sec) * 1000000 +
+                       (tv_inbulk_sort.tv_usec - tvstart.tv_usec);
+    LOG(INFO) << "[dbg] time consumed in bulks sorting  " << t_bulkstort
+              << " microsecond";
+
+    long t_bulkmerge = (tv_bulk_merge.tv_sec - tv_inbulk_sort.tv_sec) * 1000000 +
+                       (tv_bulk_merge.tv_usec - tv_inbulk_sort.tv_usec);
+    LOG(INFO) << "[dbg] time consumed in bulks merging  " << t_bulkmerge
+              << " microsecond";
+
+    long t_shuffle = (tv_shuffle.tv_sec - tv_bulk_merge.tv_sec) * 1000000 +
+                     (tv_shuffle.tv_usec - tv_bulk_merge.tv_usec);
+    LOG(INFO) << "[dbg] time consumed in bulks shuffle  " << t_shuffle
+              << " microsecond";
+
+    long t_total = (tvend.tv_sec - tvstart.tv_sec) * 1000000 +
+                   (tvend.tv_usec - tvstart.tv_usec);
+
+    LOG(INFO) << "[dbg] time consumed in avx sort  " << t_total << " microsecond";
+    LOG(INFO) << "[dbg] avx sort throughput  " <<  (double) nitems / (double)t_total * 1000000 << " tuples/second";
+
+
+
+  }
+
+
+
+
+ }
 
 // Sort the sequence of tuples from [first, last).
 // Begin with a sorted sequence of size 1 [first, first+1).

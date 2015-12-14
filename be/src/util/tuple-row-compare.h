@@ -81,6 +81,29 @@ class TupleRowComparator {
     return 0; // fully equivalent key
   }
 
+
+  bool prefix_equal_n(TupleRow* lhs, TupleRow* rhs, int n ) const {
+    for (int i = 0; i < n; ++i) {
+      void* lhs_value = key_expr_ctxs_lhs_[i]->GetValue(lhs);
+      void* rhs_value = key_expr_ctxs_rhs_[i]->GetValue(rhs);
+
+      // The sort order of NULLs is independent of asc/desc.
+      if (lhs_value == NULL && rhs_value == NULL) continue;
+      if (lhs_value == NULL && rhs_value != NULL) return false;
+      if (lhs_value != NULL && rhs_value == NULL) return false;
+
+      int result = RawValue::Compare(lhs_value, rhs_value,
+                                     key_expr_ctxs_lhs_[i]->root()->type());
+
+      if (result == 0) continue;
+      else return false;
+      // Otherwise, try the next Expr
+    }
+    return true; // fully equivalent key
+  }
+
+
+
   /// Returns true if lhs is strictly less than rhs.
   /// All exprs (key_exprs_lhs_ and key_exprs_rhs_) must have been prepared and opened
   /// before calling this.
@@ -95,6 +118,25 @@ class TupleRowComparator {
     TupleRow* rhs_row = reinterpret_cast<TupleRow*>(&rhs);
     return (*this)(lhs_row, rhs_row);
   }
+
+
+  std::vector<ExprContext*> get_key_expr_ctxs_lhs_() const{
+    return key_expr_ctxs_lhs_;
+  }
+
+  std::vector<ExprContext*> get_key_expr_ctxs_rhs_() const{
+    return key_expr_ctxs_rhs_;
+  }
+
+  std::vector<bool> get_is_asc_() const{
+    return is_asc_;
+  }
+
+  std::vector<int8_t> get_nulls_first_() const{
+    return nulls_first_;
+  }
+
+
 
  private:
   std::vector<ExprContext*> key_expr_ctxs_lhs_;
